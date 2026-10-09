@@ -1,0 +1,27 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ftuna",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "triggers": {
+    "crons": ["17 * * * *"]
+  },
+  "vars": {
+    "S3_ENDPOINT": "s3.us-east-005.backblazeb2.com",
+    "S3_BUCKET_NAME": "ftunab2",
+    "S3_REGION": "us-east-005",
+    "POW_BITS": "34" // about one minute across 16 cores at ~2.1e8 hashes/s
+  },
+  "routes": [
+    { "pattern": "ftuna.eu", "custom_domain": true },
+    { "pattern": "repo-oss.ftuna.eu", "custom_domain": true },
+    { "pattern": "repo-openrepos.ftuna.eu", "custom_domain": true },
+    { "pattern": "scratchpad-repo.ftuna.eu", "custom_domain": true },
+    { "pattern": "cdn-mirror.ftuna.eu", "custom_domain": true }
+  ]
+}
