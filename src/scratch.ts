@@ -127,7 +127,7 @@ export async function handleAPI(request: Request, env: Env, store: Store): Promi
 
 async function dispatch(request: Request, url: URL, env: Env, store: Store): Promise<Response> {
   const path = url.pathname;
-  if (request.method === "POST" && path === "/v1/challenge") return challenge(env);
+  if (request.method === "POST" && path === "/v1/challenge") return challenge(request, env);
   if (request.method === "POST" && path === "/v1/register") return register(request, env, store);
   if (request.method === "GET" && path === "/v1/account") return currentAccount(request, store);
   const repo = path.match(/^\/v1\/repos(?:\/([a-z0-9][a-z0-9_-]{0,79}))?$/);
@@ -140,10 +140,10 @@ async function dispatch(request: Request, url: URL, env: Env, store: Store): Pro
   return text("method not allowed", 405);
 }
 
-function challenge(env: Env): Response {
+async function challenge(request: Request, env: Env): Promise<Response> {
   const secret = env.POW_SECRET;
   if (!secret) return text("not configured", 500);
-  const bits = bitsOf(env);
+  const bits = await bitsFor(request, env);
   const exp = now() + 45 * 60;
   const nonce = randomBytes(16).toString("hex");
   const body = `${exp}.${bits}.${nonce}`;
@@ -158,11 +158,12 @@ async function register(request: Request, env: Env, store: Store): Promise<Respo
   if (!body.challenge || typeof body.solution !== "string") return text("bad request", 400);
   const parts = body.challenge.split(".");
   if (parts.length !== 4) return text("bad challenge", 400);
-  const [exp, bits, nonce, mac] = parts;
-  if (hmacHex(secret, `${exp}.${bits}.${nonce}`) !== mac) return text("bad challenge", 400);
-  if (Number(bits) !== bitsOf(env) || Number(exp) < now()) return text("bad challenge", 400);
+  const [exp, bitsText, nonce, mac] = parts;
+  if (hmacHex(secret, `${exp}.${bitsText}.${nonce}`) !== mac) return text("bad challenge", 400);
+  const bits = Number(bitsText);
+  if (!allowedBits(env, bits) || Number(exp) < now()) return text("bad challenge", 400);
   if (!/^\d{1,20}$/.test(body.solution)) return text("bad solution", 400);
-  if (zeroBits(createHash("sha256").update(body.challenge + body.solution).digest()) < Number(bits)) return text("bad solution", 400);
+  if (zeroBits(createHash("sha256").update(body.challenge + body.solution).digest()) < bits) return text("bad solution", 400);
   const used = `scratch/_pow/${exp}/${mac}`;
   if (await store.get(used)) return text("challenge used", 409);
   await store.put(used, Buffer.from("1"), "text/plain");
@@ -598,6 +599,203 @@ function tusHeaders(up: Up): Record<string, string> {
 function bitsOf(env: Env): number {
   const n = Number(env.POW_BITS || "34");
   if (!Number.isInteger(n) || n < 1 || n > 40) return 34;
+  return n;
+}
+
+// Work scales as 2^bits. 80% less time is a fifth of the hashes, log2(5) fewer bits, rounded.
+function easierBits(bits: number): number {
+  const n = Math.round(bits + Math.log2(0.2));
+  if (n < 1) return 1;
+  return n < bits ? n : bits;
+}
+
+function allowedBits(env: Env, bits: number): boolean {
+  if (!Number.isInteger(bits)) return false;
+  const full = bitsOf(env);
+  return bits === full || bits === easierBits(full);
+}
+
+const GITHUB_META = "https://api.github.com/meta";
+const ACTIONS_TTL = 60 * 60 * 1000;
+const V6_ALL = (1n << 128n) - 1n;
+
+type V4Net = { net: number; mask: number };
+type V6Net = { net: bigint; mask: bigint };
+type ActionsNets = { v4: V4Net[]; v6: V6Net[] };
+
+let actionsCache: { until: number; nets: ActionsNets } | null = null;
+let actionsLoad: Promise<ActionsNets | null> | null = null;
+
+export function clearActionsCache(): void {
+  actionsCache = null;
+  actionsLoad = null;
+}
+
+async function bitsFor(request: Request, env: Env): Promise<number> {
+  const bits = bitsOf(env);
+  const ip = request.headers.get("cf-connecting-ip")?.trim();
+  if (!ip) return bits;
+  const nets = await actionsNets();
+  if (!nets || !inActions(ip, nets)) return bits;
+  return easierBits(bits);
+}
+
+async function actionsNets(): Promise<ActionsNets | null> {
+  if (actionsCache && actionsCache.until > Date.now()) return actionsCache.nets;
+  if (!actionsLoad) {
+    const load = loadActionsNets().finally(() => {
+      if (actionsLoad === load) actionsLoad = null;
+    });
+    actionsLoad = load;
+  }
+  return actionsLoad;
+}
+
+async function loadActionsNets(): Promise<ActionsNets | null> {
+  try {
+    const got = await fetchMeta();
+    if (!got) return null;
+    const nets = parseActions(got.body);
+    if (!nets) {
+      if (got.fromEdge) await edgeCache()?.delete(GITHUB_META);
+      return null;
+    }
+    if (!got.fromEdge) await rememberMeta(got.body);
+    actionsCache = { until: Date.now() + ACTIONS_TTL, nets };
+    return nets;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchMeta(): Promise<{ body: unknown; fromEdge: boolean } | null> {
+  const edge = edgeCache();
+  if (edge) {
+    try {
+      const hit = await edge.match(GITHUB_META);
+      if (hit) return { body: await hit.json(), fromEdge: true };
+    } catch {
+      // Fetch the list. A failed lookup is not treated as GitHub Actions.
+    }
+  }
+  const res = await fetch(GITHUB_META, {
+    headers: { accept: "application/vnd.github+json", "user-agent": "ftuna-worker" },
+    redirect: "manual",
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) {
+    await res.body?.cancel();
+    return null;
+  }
+  return { body: await res.json(), fromEdge: false };
+}
+
+async function rememberMeta(body: unknown) {
+  const edge = edgeCache();
+  if (!edge) return;
+  try {
+    await edge.put(
+      GITHUB_META,
+      new Response(JSON.stringify(body), { headers: { "cache-control": "public, max-age=3600" } }),
+    );
+  } catch {
+    // This isolate still has the parsed list in memory.
+  }
+}
+
+function edgeCache(): Cache | null {
+  if (typeof caches === "undefined" || !caches?.default) return null;
+  return caches.default;
+}
+
+function parseActions(body: unknown): ActionsNets | null {
+  if (!body || typeof body !== "object") return null;
+  const meta = body as { actions?: unknown; actions_macos?: unknown };
+  if (!Array.isArray(meta.actions)) return null;
+  const nets: ActionsNets = { v4: [], v6: [] };
+  addList(nets, meta.actions);
+  if (Array.isArray(meta.actions_macos)) addList(nets, meta.actions_macos);
+  if (nets.v4.length === 0 && nets.v6.length === 0) return null;
+  return nets;
+}
+
+function addList(nets: ActionsNets, list: unknown[]) {
+  for (const item of list) if (typeof item === "string") addCIDR(nets, item);
+}
+
+function addCIDR(nets: ActionsNets, cidr: string) {
+  const slash = cidr.lastIndexOf("/");
+  if (slash <= 0) return;
+  const base = cidr.slice(0, slash);
+  const prefix = Number(cidr.slice(slash + 1));
+  if (!Number.isInteger(prefix) || prefix < 1) return;
+  if (base.includes(":")) {
+    if (prefix > 128) return;
+    const addr = parseIPv6(base);
+    if (addr === null) return;
+    const mask = (V6_ALL << BigInt(128 - prefix)) & V6_ALL;
+    nets.v6.push({ net: addr & mask, mask });
+    return;
+  }
+  if (prefix > 32) return;
+  const addr = parseIPv4(base);
+  if (addr === null) return;
+  const mask = v4mask(prefix);
+  nets.v4.push({ net: (addr & mask) >>> 0, mask });
+}
+
+function inActions(ip: string, nets: ActionsNets): boolean {
+  if (ip.includes(":")) {
+    const addr = parseIPv6(ip);
+    if (addr === null) return false;
+    return nets.v6.some((net) => (addr & net.mask) === net.net);
+  }
+  const addr = parseIPv4(ip);
+  if (addr === null) return false;
+  return nets.v4.some((net) => ((addr & net.mask) >>> 0) === net.net);
+}
+
+function v4mask(prefix: number): number {
+  if (prefix >= 32) return 0xffffffff;
+  return (0xffffffff << (32 - prefix)) >>> 0;
+}
+
+function parseIPv4(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    n = n * 256 + octet;
+  }
+  return n;
+}
+
+function parseIPv6(input: string): bigint | null {
+  let ip = input;
+  if (ip.includes(".")) {
+    const last = ip.lastIndexOf(":");
+    if (last < 0) return null;
+    const v4 = parseIPv4(ip.slice(last + 1));
+    if (v4 === null) return null;
+    ip = `${ip.slice(0, last + 1)}${(v4 >>> 16).toString(16)}:${(v4 & 0xffff).toString(16)}`;
+  }
+  const halves = ip.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 && missing !== 0) return null;
+  if (halves.length === 2 && missing < 1) return null;
+  const groups = [...head, ...Array(missing).fill("0"), ...tail];
+  if (groups.length !== 8) return null;
+  let n = 0n;
+  for (const group of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(group)) return null;
+    n = (n << 16n) + BigInt(parseInt(group, 16));
+  }
   return n;
 }
 

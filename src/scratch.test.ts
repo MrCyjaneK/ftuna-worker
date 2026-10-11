@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { handle } from "./index.ts";
-import { allowPath, extractTar, HTTPError, runGC, scratchDocs, zeroBits } from "./scratch.ts";
+import { allowPath, clearActionsCache, extractTar, HTTPError, runGC, scratchDocs, zeroBits } from "./scratch.ts";
 import { route } from "./site.ts";
 import type { Store } from "./store.ts";
 
@@ -91,6 +91,112 @@ test("a bad rpm or a stray file is rejected", async () => {
     { name: "notes.txt", data: new Uint8Array([1]) },
   ]);
   await assert.rejects(extractTar(memory().store, cursor(stray), "scratch/a/b", 1024, 1 << 20), /bad path/);
+});
+
+test("github actions challenges take about a fifth as long", async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  let meta: { status: number; body: string } | { error: true } = { status: 200, body: "{}" };
+  globalThis.fetch = async (input) => {
+    assert.equal(String(input), "https://api.github.com/meta");
+    calls++;
+    if ("error" in meta) throw new Error("meta down");
+    return new Response(meta.body, { status: meta.status, headers: { "content-type": "application/json" } });
+  };
+  const bitsFor = async (ip: string | undefined, seen = env()) => {
+    const res = await api(seen, memory().store, "/v1/challenge", {
+      method: "POST",
+      headers: ip ? { "cf-connecting-ip": ip } : {},
+    });
+    const ch = JSON.parse(await res.text()) as { challenge: string; bits: number };
+    return { status: res.status, ...ch };
+  };
+  try {
+    assert.match(scratchDocs, /GitHub-hosted Actions/);
+    clearActionsCache();
+    const plain = await bitsFor(undefined);
+    assert.equal(calls, 0);
+    assert.equal(plain.bits, 8);
+
+    meta = { status: 200, body: JSON.stringify({ actions: ["203.0.113.0/24", "not-a-cidr", "2001:db8:1::/48"] }) };
+    clearActionsCache();
+    assert.equal((await bitsFor("198.51.100.10")).bits, 8);
+    clearActionsCache();
+    assert.equal((await bitsFor("203.0.113.255")).bits, 6);
+    clearActionsCache();
+    assert.equal((await bitsFor("203.0.114.0")).bits, 8);
+    clearActionsCache();
+    assert.equal((await bitsFor("2001:0db8:0001:0000:0000:0000:0000:0001")).bits, 6);
+    clearActionsCache();
+    assert.equal((await bitsFor("2001:db8:2::1")).bits, 8);
+
+    meta = {
+      status: 200,
+      body: JSON.stringify({ actions: ["203.0.113.0/24"], actions_macos: ["198.51.100.8/32"] }),
+    };
+    clearActionsCache();
+    assert.equal((await bitsFor("198.51.100.8")).bits, 6);
+    clearActionsCache();
+    assert.equal((await bitsFor("203.0.113.10", { POW_SECRET: "test-secret", POW_BITS: "34" } as Env)).bits, 32);
+
+    meta = { error: true };
+    clearActionsCache();
+    const down = await bitsFor("203.0.113.10");
+    assert.equal(down.status, 200);
+    assert.equal(down.bits, 8);
+    const afterDown = calls;
+    assert.equal((await bitsFor("203.0.113.10")).bits, 8);
+    assert.equal(calls, afterDown + 1);
+
+    meta = { status: 200, body: JSON.stringify({ hooks: ["203.0.113.0/24"] }) };
+    clearActionsCache();
+    assert.equal((await bitsFor("203.0.113.10")).bits, 8);
+    meta = { status: 500, body: "" };
+    clearActionsCache();
+    assert.equal((await bitsFor("203.0.113.10")).bits, 8);
+    meta = { status: 200, body: "nope" };
+    clearActionsCache();
+    assert.equal((await bitsFor("203.0.113.10")).bits, 8);
+
+    meta = { status: 200, body: JSON.stringify({ actions: ["203.0.113.0/24"] }) };
+    clearActionsCache();
+    const before = calls;
+    assert.equal((await bitsFor("203.0.113.10")).bits, 6);
+    meta = { status: 200, body: JSON.stringify({ actions: ["198.51.100.0/24"] }) };
+    assert.equal((await bitsFor("203.0.113.10")).bits, 6);
+    assert.equal(calls, before + 1);
+
+    const mem = memory();
+    const easy = await api(env(), mem.store, "/v1/challenge", {
+      method: "POST",
+      headers: { "cf-connecting-ip": "203.0.113.10" },
+    });
+    const ch = JSON.parse(await easy.text()) as { challenge: string; bits: number };
+    assert.equal(ch.bits, 6);
+    let solution = "";
+    for (let i = 0; ; i++) {
+      const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(ch.challenge + i)));
+      if (zeroBits(hash) >= ch.bits) {
+        solution = String(i);
+        break;
+      }
+    }
+    const registered = await api(env(), mem.store, "/v1/register", {
+      method: "POST",
+      body: JSON.stringify({ challenge: ch.challenge, solution }),
+    });
+    assert.equal(registered.status, 200, await registered.clone().text());
+    const tampered = ch.challenge.split(".");
+    tampered[1] = "5";
+    const rejected = await api(env(), mem.store, "/v1/register", {
+      method: "POST",
+      body: JSON.stringify({ challenge: tampered.join("."), solution: "1" }),
+    });
+    assert.equal(rejected.status, 400);
+  } finally {
+    globalThis.fetch = realFetch;
+    clearActionsCache();
+  }
 });
 
 test("register, upload, and expiry", async () => {
