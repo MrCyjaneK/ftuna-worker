@@ -68,6 +68,7 @@ h2 { font-size: 1.15rem; font-weight: 600; letter-spacing: -0.01em; margin: 1.8r
 
 const sites = [
   ["https://repo-oss.ftuna.eu/", "FTuna OSS", "repo-oss.ftuna.eu", "Official catalog. Open source."],
+  ["https://repo-oss.ftuna.eu/status", "Packaging", "repo-oss.ftuna.eu/status", "Build status for the open source catalog."],
   ["https://repo-openrepos.ftuna.eu/", "OpenRepos", "repo-openrepos.ftuna.eu", "Mirror of openrepos.net"],
   ["https://scratchpad-repo.ftuna.eu/", "Scratch", "scratchpad-repo.ftuna.eu", "Unsigned one-off builds, temporary."],
   ["https://cdn-mirror.ftuna.eu/", "CDN", "cdn-mirror.ftuna.eu", "Icons, screenshots and other external resources."],
@@ -104,9 +105,13 @@ export const homeText =
 
 export function indexHTML(req: StoreRequest, dirs: string[], files: { key: string; size: number }[]): string {
   const title = indexTitle(req);
+  const brand =
+    req.prefix === "repo/ftuna-oss" && req.path === ""
+      ? `<p class="brand"><a href="https://ftuna.eu/">FTuna</a> · <a href="/status">Packaging</a></p>`
+      : `<p class="brand"><a href="https://ftuna.eu/">FTuna</a></p>`;
   return document(
     title,
-    `<p class="brand"><a href="https://ftuna.eu/">FTuna</a></p>
+    `${brand}
 <h1>${escapeHtml(title)}</h1>
 ${listingTable(req, dirs, files)}`,
   );
@@ -163,7 +168,7 @@ export function formatSize(bytes: number): string {
   return `${text} ${units[i]}`;
 }
 
-function document(title: string, body: string): string {
+export function document(title: string, body: string, extraCss = ""): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -173,7 +178,7 @@ function document(title: string, body: string): string {
 <meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#141311" media="(prefers-color-scheme: dark)">
 <title>${escapeHtml(title)}</title>
-<style>${css}</style>
+<style>${css}${extraCss}</style>
 </head>
 <body>
 ${body}

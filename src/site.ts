@@ -8,6 +8,7 @@ export type StoreRequest = {
 export type Route =
   | { kind: "page" }
   | { kind: "docs" }
+  | { kind: "status" }
   | { kind: "redirect"; location: string }
   | StoreRequest
   | { kind: "unknown" }
@@ -38,6 +39,8 @@ export function route(hostname: string, pathname: string): Route {
     return { kind: "unknown" };
   }
   if (host === "scratchpad-repo.ftuna.eu" && (pathname === "/" || pathname === "")) return { kind: "docs" };
+  if (host === "repo-oss.ftuna.eu" && pathname === "/status") return { kind: "status" };
+  if (host === "repo-oss.ftuna.eu" && pathname === "/status/") return { kind: "redirect", location: "/status" };
   const parsed = parsePath(pathname);
   if (!parsed) return { kind: "bad" };
   return { kind: "store", prefix: mount, path: parsed.path, directory: parsed.directory };

@@ -1,4 +1,5 @@
 import { docsHTML, docsText, homePage, homeText, indexHTML, indexText } from "./html.ts";
+import { statusPage, statusText } from "./status.ts";
 import { getObject, hasPrefix, listPrefix as listKeys, client, s3Store, type Bucket } from "./s3.ts";
 import { handleAPI, runGC, scratchDocs } from "./scratch.ts";
 import type { Store } from "./store.ts";
@@ -16,6 +17,7 @@ export async function handle(request: Request, env: Env, store?: Store): Promise
   const routed = route(url.hostname, url.pathname);
   if (routed.kind === "docs") return scratchHome(request, env, store);
   if (routed.kind === "page") return page(request, homePage, homeText);
+  if (routed.kind === "status") return page(request, statusPage, statusText);
   if (routed.kind === "redirect") {
     return Response.redirect(new URL(routed.location, url).toString(), 302);
   }

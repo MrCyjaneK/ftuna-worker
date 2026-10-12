@@ -27,6 +27,16 @@ test("repo mounts strip to their prefix", () => {
   assert.equal(objectKey("repo/ftuna-oss", "5.1.0.11/aarch64/pkg.rpm"), "repo/ftuna-oss/5.1.0.11/aarch64/pkg.rpm");
   assert.equal(listPrefix("scratch", ""), "scratch/");
   assert.equal(listPrefix("", ""), "");
+  assert.deepEqual(route("repo-oss.ftuna.eu", "/status"), { kind: "status" });
+  assert.deepEqual(route("repo-oss.ftuna.eu", "/status/"), { kind: "redirect", location: "/status" });
+  assert.equal(route("repo-oss.ftuna.eu", "/5.1.0.11/status.json").kind, "store");
+  assert.equal(route("ftuna.eu", "/status").kind, "unknown");
+  assert.deepEqual(route("repo-openrepos.ftuna.eu", "/status"), {
+    kind: "store",
+    prefix: "mirror/openrepos",
+    path: "status",
+    directory: false,
+  });
 });
 
 test("cdn mirror keeps the origin host in the path", () => {
@@ -80,6 +90,7 @@ test("home page links every host and follows the color scheme", () => {
     assert.ok(homePage.includes(`href="${host}"`));
   }
   assert.ok(homePage.includes('href="/files/"'));
+  assert.ok(homePage.includes('href="https://repo-oss.ftuna.eu/status"'));
   assert.equal(homePage.includes("<script"), false);
   assert.ok(homePage.includes("prefers-color-scheme: dark"));
   assert.ok(homePage.includes('name="color-scheme" content="light dark"'));
@@ -92,6 +103,7 @@ test("plain home page names every host", () => {
     "https://scratchpad-repo.ftuna.eu/",
     "https://cdn-mirror.ftuna.eu/",
     "https://ftuna.eu/files/",
+    "https://repo-oss.ftuna.eu/status",
   ]) {
     assert.ok(homeText.includes(host));
   }
@@ -139,6 +151,11 @@ test("index follows the color scheme and escapes names", () => {
   assert.ok(html.includes("&lt;dir&gt;/"));
   assert.ok(html.includes("a&lt;b&gt;.rpm"));
   assert.ok(html.includes("1.5 KB"));
+  assert.equal(html.includes('href="/status"'), false);
+  const root = indexHTML({ kind: "store", prefix: "repo/ftuna-oss", path: "", directory: true }, [], []);
+  assert.ok(root.includes('href="/status">Packaging</a>'));
+  const other = indexHTML({ kind: "store", prefix: "mirror/openrepos", path: "", directory: true }, [], []);
+  assert.equal(other.includes('href="/status"'), false);
   assert.ok(html.indexOf("&lt;dir&gt;/") < html.indexOf("a&lt;b&gt;.rpm"));
   assert.equal(html.includes("<script"), false);
   assert.ok(html.includes("prefers-color-scheme: dark"));
