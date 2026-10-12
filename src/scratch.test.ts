@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { handle } from "./index.ts";
-import { allowPath, clearActionsCache, extractTar, HTTPError, runGC, scratchDocs, zeroBits } from "./scratch.ts";
+import { allowPath, clearActionsCache, copyPartBytes, copySteps, extractTar, HTTPError, runGC, scratchDocs, zeroBits } from "./scratch.ts";
 import { route } from "./site.ts";
 import type { Store } from "./store.ts";
 
@@ -463,6 +463,435 @@ test("the go client can publish", async () => {
   assert.equal(body![1], 0xab);
 });
 
+test("a storage error leaves the offset in place", async () => {
+  const mem = memory();
+  let fail = true;
+  const store: Store = {
+    ...mem.store,
+    async put(key, body, type) {
+      if (fail && key.endsWith(".rpm")) throw new Error("put 503 storage");
+      return mem.store.put(key, body, type);
+    },
+  };
+  const seen = env();
+  const account = await register(seen, store);
+  const name = "place";
+  const rpm = new Uint8Array([0xed, 0xab, 0xee, 0xdb, 1, 2, 3, 4]);
+  const archive = ustar([
+    { name: "aarch64/app.rpm", data: rpm },
+    { name: "aarch64/repodata/repomd.xml", data: new TextEncoder().encode("<repomd/>") },
+  ]);
+  const created = await api(seen, store, "/v1/repos", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${account.token}`,
+      "tus-resumable": "1.0.0",
+      "upload-length": String(archive.length),
+      "x-ftuna-id": name,
+    },
+  });
+  assert.equal(created.status, 201, await created.clone().text());
+  const headers = {
+    authorization: `Bearer ${account.token}`,
+    "tus-resumable": "1.0.0",
+    "upload-offset": "0",
+    "content-type": "application/offset+octet-stream",
+  };
+  const first = await api(seen, store, `/v1/repos/${name}`, { method: "PATCH", headers, body: archive });
+  assert.equal(first.status, 502);
+  assert.match(await first.text(), /storage error/);
+  const head = await api(seen, store, `/v1/repos/${name}`, {
+    method: "HEAD",
+    headers: { authorization: headers.authorization, "tus-resumable": "1.0.0" },
+  });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get("upload-offset"), "0");
+  fail = false;
+  const second = await api(seen, store, `/v1/repos/${name}`, { method: "PATCH", headers, body: archive });
+  assert.equal(second.status, 204, await second.clone().text());
+  assert.equal(second.headers.get("x-ftuna-repo"), `/${account.account}/${name}/`);
+  assert.deepEqual(await mem.store.get(`scratch/${account.account}/${name}/aarch64/app.rpm`), rpm);
+});
+
+test("a chunk can end inside the next header", async () => {
+  const mem = memory();
+  const seen = env();
+  const account = await register(seen, mem.store);
+  const data = new Uint8Array(5 * 1024 * 1024 - 512);
+  data.set([0xed, 0xab, 0xee, 0xdb]);
+  for (let i = 4; i < 64; i++) data[i] = i;
+  const archive = ustar([
+    { name: "aarch64/app.rpm", data },
+    { name: "aarch64/repodata/repomd.xml", data: new TextEncoder().encode("<repomd/>") },
+  ]);
+  const cut = 5 * 1024 * 1024 + 100;
+  assert.ok(cut < archive.length);
+  const name = "split";
+  const created = await api(seen, mem.store, "/v1/repos", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${account.token}`,
+      "tus-resumable": "1.0.0",
+      "upload-length": String(archive.length),
+      "x-ftuna-id": name,
+    },
+  });
+  assert.equal(created.status, 201, await created.clone().text());
+  const send = (offset: number, body: Uint8Array) =>
+    api(seen, mem.store, `/v1/repos/${name}`, {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${account.token}`,
+        "tus-resumable": "1.0.0",
+        "upload-offset": String(offset),
+        "content-type": "application/offset+octet-stream",
+      },
+      body,
+    });
+  const first = await send(0, archive.subarray(0, cut));
+  assert.equal(first.status, 204, await first.clone().text());
+  assert.equal(first.headers.get("upload-offset"), String(cut));
+  assert.equal(first.headers.get("x-ftuna-repo"), null);
+  const second = await send(cut, archive.subarray(cut));
+  assert.equal(second.status, 204, await second.clone().text());
+  assert.equal(second.headers.get("x-ftuna-repo"), `/${account.account}/${name}/`);
+  const stored = await mem.store.get(`scratch/${account.account}/${name}/aarch64/app.rpm`);
+  assert.equal(stored?.length, data.length);
+  assert.equal(stored?.[0], 0xed);
+  assert.equal(stored?.[63], 63);
+  assert.equal(
+    new TextDecoder().decode(await mem.store.get(`scratch/${account.account}/${name}/aarch64/repodata/repomd.xml`)),
+    "<repomd/>",
+  );
+});
+
+test("a part storage error keeps the earlier chunk", async () => {
+  const mem = memory();
+  let fails = 1;
+  const store: Store = {
+    ...mem.store,
+    async putPart(key, id, n, body) {
+      if (fails > 0) {
+        fails--;
+        throw new Error("part 503 storage");
+      }
+      return mem.store.putPart(key, id, n, body);
+    },
+  };
+  const seen = env();
+  const account = await register(seen, store);
+  const data = new Uint8Array(9 * 1024 * 1024);
+  data.set([0xed, 0xab, 0xee, 0xdb]);
+  data[100] = 42;
+  const archive = ustar([
+    { name: "aarch64/app.rpm", data },
+    { name: "aarch64/repodata/repomd.xml", data: new TextEncoder().encode("<repomd/>") },
+  ]);
+  const name = "parts";
+  const created = await api(seen, store, "/v1/repos", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${account.token}`,
+      "tus-resumable": "1.0.0",
+      "upload-length": String(archive.length),
+      "x-ftuna-id": name,
+    },
+  });
+  assert.equal(created.status, 201, await created.clone().text());
+  const chunk = 5 * 1024 * 1024;
+  let offset = 0;
+  let failed = false;
+  let repo = "";
+  for (let guard = 0; guard < 8 && !repo; guard++) {
+    const n = Math.min(chunk, archive.length - offset);
+    const res = await api(seen, store, `/v1/repos/${name}`, {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${account.token}`,
+        "tus-resumable": "1.0.0",
+        "upload-offset": String(offset),
+        "content-type": "application/offset+octet-stream",
+      },
+      body: archive.subarray(offset, offset + n),
+    });
+    if (res.status === 502) {
+      assert.match(await res.text(), /storage error/);
+      failed = true;
+      const head = await api(seen, store, `/v1/repos/${name}`, {
+        method: "HEAD",
+        headers: { authorization: `Bearer ${account.token}`, "tus-resumable": "1.0.0" },
+      });
+      assert.equal(head.headers.get("upload-offset"), String(offset));
+      continue;
+    }
+    assert.equal(res.status, 204, await res.clone().text());
+    const next = Number(res.headers.get("upload-offset"));
+    assert.ok(next >= offset);
+    offset = next;
+    repo = res.headers.get("x-ftuna-repo") ?? "";
+  }
+  assert.equal(failed, true);
+  assert.equal(repo, `/${account.account}/${name}/`);
+  const stored = await mem.store.get(`scratch/${account.account}/${name}/aarch64/app.rpm`);
+  assert.equal(stored?.length, data.length);
+  assert.equal(stored?.[100], 42);
+});
+
+test("a large object is copied across requests", async () => {
+  const mem = memory();
+  const seen = env();
+  const account = await register(seen, mem.store);
+  const huge = copyPartBytes * (copySteps + 1);
+  const name = "wide";
+  const up = {
+    account: account.account,
+    id: name,
+    length: 100,
+    offset: 80,
+    at: Math.floor(Date.now() / 1000),
+    parts: [] as { off: number; len: number }[],
+    tar: {
+      phase: "zero",
+      header: "",
+      tail: "",
+      pad: 0,
+      file: null,
+      rpm: true,
+      repomd: true,
+      files: 2,
+      written: huge + 8,
+      produced: [
+        { name: "aarch64/big.rpm", size: huge },
+        { name: "aarch64/repodata/repomd.xml", size: 8 },
+      ],
+      ready: true,
+      copy: null,
+      copyIndex: 0,
+    },
+  };
+  await mem.store.put(`incoming/${account.account}/${name}.json`, Buffer.from(JSON.stringify(up)), "application/json");
+  await mem.store.put(
+    `staging/${account.account}/${name}/aarch64/repodata/repomd.xml`,
+    new TextEncoder().encode("<repomd/>"),
+    "application/xml",
+  );
+  const ranges: [number, number][] = [];
+  const store: Store = {
+    ...mem.store,
+    async copyPart(_from, to, id, n, start, end) {
+      ranges.push([start, end]);
+      return mem.store.putPart(to, id, n, new Uint8Array([n]));
+    },
+  };
+  let offset = 80;
+  let repo = "";
+  let rounds = 0;
+  let continued = 0;
+  for (; rounds < 6 && !repo; rounds++) {
+    const res = await api(seen, store, `/v1/repos/${name}`, {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${account.token}`,
+        "tus-resumable": "1.0.0",
+        "upload-offset": String(offset),
+        "content-type": "application/offset+octet-stream",
+      },
+      body: offset === 100 ? new Uint8Array() : new Uint8Array(20),
+    });
+    assert.equal(res.status, 204, await res.clone().text());
+    const next = Number(res.headers.get("upload-offset"));
+    repo = res.headers.get("x-ftuna-repo") ?? "";
+    assert.equal(next, 100);
+    if (offset === 100) continued++;
+    offset = next;
+  }
+  assert.ok(continued > 0);
+  assert.ok(rounds > 1);
+  assert.equal(repo, `/${account.account}/${name}/`);
+  assert.equal(offset, 100);
+  assert.equal(ranges.length, copySteps + 1);
+  let covered = 0;
+  for (const [start, end] of ranges) {
+    assert.equal(start, covered);
+    assert.ok(end - start <= copyPartBytes);
+    covered = end;
+  }
+  assert.equal(covered, huge);
+  assert.equal(
+    new TextDecoder().decode(await mem.store.get(`scratch/${account.account}/${name}/aarch64/repodata/repomd.xml`)),
+    "<repomd/>",
+  );
+});
+
+test("six gibibytes is published in bounded steps", { timeout: 300_000 }, async () => {
+  const rpmSize = 6 * 1024 * 1024 * 1024;
+  const header = headerBlock("aarch64/big.rpm", rpmSize);
+  const padLen = (512 - (rpmSize % 512)) % 512;
+  const repomdBody = new TextEncoder().encode("<repomd/>");
+  const repomdHeader = headerBlock("aarch64/repodata/repomd.xml", repomdBody.length);
+  const repomdPad = (512 - (repomdBody.length % 512)) % 512;
+  const repomdAt = header.length + rpmSize + padLen;
+  const total = repomdAt + repomdHeader.length + repomdBody.length + repomdPad + 1024;
+  const sparse = sparseStore();
+  const seen = env();
+  const account = await register(seen, sparse.store);
+  const name = "huge";
+  const created = await api(seen, sparse.store, "/v1/repos", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${account.token}`,
+      "tus-resumable": "1.0.0",
+      "upload-length": String(total),
+      "x-ftuna-id": name,
+    },
+  });
+  assert.equal(created.status, 201, await created.clone().text());
+  const chunk = 8 * 1024 * 1024;
+  const body = new Uint8Array(chunk);
+  let at = 0;
+  let repo = "";
+  for (let guard = 0; guard < 2000 && !repo; guard++) {
+    const n = Math.min(chunk, total - at);
+    body.fill(0, 0, n);
+    stamp(body, at, 0, header, n);
+    const magicAt = header.length;
+    for (let i = 0; i < 4; i++) {
+      const pos = magicAt + i;
+      if (pos >= at && pos < at + n) body[pos - at] = [0xed, 0xab, 0xee, 0xdb][i];
+    }
+    stamp(body, at, repomdAt, repomdHeader, n);
+    stamp(body, at, repomdAt + repomdHeader.length, repomdBody, n);
+    const res = await api(seen, sparse.store, `/v1/repos/${name}`, {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${account.token}`,
+        "tus-resumable": "1.0.0",
+        "upload-offset": String(at),
+        "content-type": "application/offset+octet-stream",
+      },
+      body: body.subarray(0, n),
+    });
+    assert.equal(res.status, 204, await res.clone().text());
+    const next = Number(res.headers.get("upload-offset"));
+    assert.ok(next >= at);
+    at = next;
+    repo = res.headers.get("x-ftuna-repo") ?? "";
+  }
+  assert.equal(repo, `/${account.account}/${name}/`);
+  assert.equal(at, total);
+  assert.equal(sparse.sizes.get(`scratch/${account.account}/${name}/aarch64/big.rpm`), rpmSize);
+  assert.deepEqual(sparse.magic.get(`scratch/${account.account}/${name}/aarch64/big.rpm`), new Uint8Array([0xed, 0xab, 0xee, 0xdb]));
+  assert.equal(
+    new TextDecoder().decode(await sparse.store.get(`scratch/${account.account}/${name}/aarch64/repodata/repomd.xml`)),
+    "<repomd/>",
+  );
+  assert.ok(sparse.maxPut <= 8 * 1024 * 1024);
+  assert.ok(sparse.maxPart <= 8 * 1024 * 1024);
+  assert.ok(sparse.maxCopy <= copyPartBytes);
+});
+
+function stamp(buf: Uint8Array, start: number, at: number, src: Uint8Array, n: number) {
+  const from = Math.max(start, at);
+  const to = Math.min(start + n, at + src.length);
+  if (from >= to) return;
+  buf.set(src.subarray(from - at, to - at), from - start);
+}
+
+function sparseStore(): {
+  store: Store;
+  sizes: Map<string, number>;
+  magic: Map<string, Uint8Array>;
+  maxPut: number;
+  maxPart: number;
+  maxCopy: number;
+} {
+  const objs = new Map<string, Uint8Array>();
+  const sizes = new Map<string, number>();
+  const magic = new Map<string, Uint8Array>();
+  const ups = new Map<string, { n: number; len: number }[]>();
+  const box = { maxPut: 0, maxPart: 0, maxCopy: 0 };
+  let seq = 0;
+  const keysOf = () => new Set([...objs.keys(), ...sizes.keys()]);
+  const store: Store = {
+    async get(key) {
+      return objs.get(key) ?? null;
+    },
+    async put(key, body) {
+      box.maxPut = Math.max(box.maxPut, body.byteLength);
+      if (body.byteLength > 8 * 1024 * 1024) throw new Error("buffered " + body.byteLength);
+      objs.set(key, body.slice());
+      sizes.set(key, body.byteLength);
+      if (key.endsWith(".rpm") && body.length >= 4) magic.set(key, body.slice(0, 4));
+    },
+    async copy(from, to) {
+      const body = objs.get(from);
+      if (!body) throw new Error("missing " + from);
+      objs.set(to, body.slice());
+      sizes.set(to, sizes.get(from) ?? body.byteLength);
+      const mark = magic.get(from);
+      if (mark) magic.set(to, mark);
+    },
+    async del(key) {
+      objs.delete(key);
+      sizes.delete(key);
+      magic.delete(key);
+    },
+    async list(prefix) {
+      const level = children([...keysOf()], prefix);
+      return { dirs: level.dirs, files: level.keys.map((key) => ({ key, size: sizes.get(key) ?? objs.get(key)?.byteLength ?? 0 })) };
+    },
+    async keys(prefix) {
+      return [...keysOf()].filter((key) => key.startsWith(prefix));
+    },
+    async range() {
+      throw new Error("range");
+    },
+    async exists(key) {
+      return objs.has(key) || sizes.has(key);
+    },
+    async startMultipart() {
+      const id = String(++seq);
+      ups.set(id, []);
+      return id;
+    },
+    async putPart(key, id, n, body) {
+      box.maxPart = Math.max(box.maxPart, body.byteLength);
+      if (body.byteLength > 8 * 1024 * 1024) throw new Error("part " + body.byteLength);
+      const parts = ups.get(id);
+      if (!parts) throw new Error("missing upload");
+      const prev = parts.find((part) => part.n === n);
+      if (prev) prev.len = body.byteLength;
+      else parts.push({ n, len: body.byteLength });
+      if (n === 1 && body.length >= 4) magic.set(key, body.slice(0, 4));
+      return `"${n}"`;
+    },
+    async copyPart(from, to, id, n, start, end) {
+      const size = sizes.get(from);
+      if (size === undefined || start < 0 || end > size) throw new Error("copy range");
+      box.maxCopy = Math.max(box.maxCopy, end - start);
+      const parts = ups.get(id);
+      if (!parts) throw new Error("missing upload");
+      parts.push({ n, len: end - start });
+      const mark = magic.get(from);
+      if (n === 1 && mark) magic.set(to, mark);
+      return `"${n}"`;
+    },
+    async completeMultipart(key, id) {
+      const parts = ups.get(id);
+      if (!parts?.length) throw new Error("missing parts");
+      const total = parts.reduce((sum, part) => sum + part.len, 0);
+      sizes.set(key, total);
+      const mark = magic.get(key);
+      objs.set(key, mark ? mark.slice() : new Uint8Array());
+      ups.delete(id);
+    },
+    async abortMultipart(_key, id) {
+      ups.delete(id);
+    },
+  };
+  return { store, sizes, magic, get maxPut() { return box.maxPut; }, get maxPart() { return box.maxPart; }, get maxCopy() { return box.maxCopy; } };
+}
+
 function env(): Env {
   return { POW_SECRET: "test-secret", POW_BITS: "8" } as Env;
 }
@@ -550,6 +979,9 @@ function memory(): { store: Store; maxPart: number; maxRange: number } {
       if (!body) throw new Error("missing " + key);
       return body.slice(start, end);
     },
+    async exists(key) {
+      return objs.has(key);
+    },
     async startMultipart() {
       const id = String(++seq);
       ups.set(id, new Map());
@@ -558,6 +990,14 @@ function memory(): { store: Store; maxPart: number; maxRange: number } {
     async putPart(_key, id, n, body) {
       box.maxPart = Math.max(box.maxPart, body.byteLength);
       ups.get(id)!.set(n, body.slice());
+      return `"${n}"`;
+    },
+    async copyPart(from, _to, id, n, start, end) {
+      const body = objs.get(from);
+      if (!body) throw new Error("missing " + from);
+      const slice = body.slice(start, end);
+      box.maxPart = Math.max(box.maxPart, slice.byteLength);
+      ups.get(id)!.set(n, slice);
       return `"${n}"`;
     },
     async completeMultipart(key, id) {

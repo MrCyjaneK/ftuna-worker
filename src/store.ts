@@ -6,8 +6,10 @@ export type Store = {
   list(prefix: string): Promise<{ files: { key: string; size: number }[]; dirs: string[] }>;
   keys(prefix: string): Promise<string[]>;
   range(key: string, start: number, end: number): Promise<Uint8Array>;
+  exists(key: string): Promise<boolean>;
   startMultipart(key: string): Promise<string>;
   putPart(key: string, id: string, n: number, body: Uint8Array): Promise<string>;
+  copyPart(from: string, to: string, id: string, n: number, start: number, end: number): Promise<string>;
   completeMultipart(key: string, id: string, parts: { n: number; etag: string }[]): Promise<void>;
   abortMultipart(key: string, id: string): Promise<void>;
 };

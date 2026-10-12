@@ -8,9 +8,16 @@ const MAX_UPLOADS = 32;
 const MAX_BYTES = 256 * 1024 * 1024 * 1024;
 const IDLE = 3600;
 const MIN_CHUNK = 5 * 1024 * 1024;
-const MAX_CHUNK = 16 * 1024 * 1024;
+// A Free zone rejects a request body over 100 MB. 100 MiB is past that.
+// The isolate has 128 MB, so the body is streamed in part-sized pieces.
+const MAX_CHUNK = 90 * 1024 * 1024;
 const PART = 8 * 1024 * 1024;
-const WINDOW = 256 * 1024;
+// One request copies a few pieces, then returns. A runtime update gives an
+// in-flight request about 30 seconds to finish, and a 6GiB copy does not fit in that.
+const COPY_PART = 32 * 1024 * 1024;
+const COPY_STEPS = 4;
+export const copyPartBytes = COPY_PART;
+export const copySteps = COPY_STEPS;
 const TUS = "1.0.0";
 
 type Repo = { id: string; created: number; expire: number; bytes: number };
@@ -23,6 +30,36 @@ type User = {
   // Older builds stored the one allowed upload here. It is ignored and removed.
   pending?: { id: string; bytes: number };
 };
+type Etags = { n: number; etag: string }[];
+type Produced = { name: string; size: number };
+type CopyJob = { name: string; size: number; upload: string; sent: number; part: number; etags: Etags };
+type OpenFile = {
+  name: string;
+  size: number;
+  left: number;
+  key: string;
+  upload: string;
+  part: number;
+  etags: Etags;
+  holdGen: number;
+  seen: number;
+  skipping: boolean;
+};
+type TarState = {
+  phase: "header" | "body" | "pad" | "zero";
+  header: string;
+  tail: string;
+  pad: number;
+  file: OpenFile | null;
+  rpm: boolean;
+  repomd: boolean;
+  files: number;
+  written: number;
+  produced: Produced[];
+  ready: boolean;
+  copy: CopyJob | null;
+  copyIndex: number;
+};
 type Up = {
   account: string;
   id: string;
@@ -31,6 +68,9 @@ type Up = {
   at: number;
   parts: { off: number; len: number }[];
   replace?: boolean;
+  done?: boolean;
+  legacy?: boolean;
+  tar: TarState;
 };
 
 export class HTTPError extends Error {
@@ -53,7 +93,7 @@ Temporary rpm repositories. A repo is deleted ${keepDays} days after it is publi
 
 Find a decimal \`solution\` such that SHA-256 of the bytes \`challenge + solution\` has at least \`bits\` leading zero bits. \`POST /v1/register\` with \`{"challenge","solution"}\` returns \`account\` and \`token\`. The token is shown once.
 
-Later requests send \`Authorization: Bearer <token>\`. \`GET /v1/account\` returns \`account\` when that token still matches a stored account, and 401 when it does not.
+Later requests send \`Authorization: Bearer <token>\`. \`GET /v1/account\` returns \`account\` when that token still matches a stored account, and 401 when it does not. A challenge from GitHub-hosted Actions asks for fewer leading zero bits.
 
 ## Upload
 
@@ -71,7 +111,7 @@ The body is one uncompressed ustar archive of a repo. Allowed paths:
 - \`<arch>/repodata/repomd.xml.asc\`
 - \`info.json.xz\`
 
-At least one rpm and one \`repomd.xml\`. Anything else is rejected. A chunk that is not the last must be at least ${iec(MIN_CHUNK)}. No chunk may be larger than ${iec(MAX_CHUNK)}.
+At least one rpm and one \`repomd.xml\`. Anything else is rejected. A chunk that is not the last must be at least ${iec(MIN_CHUNK)}. No chunk may be larger than ${iec(MAX_CHUNK)}. When \`Upload-Offset\` reaches \`Upload-Length\` and the response has no \`X-Ftuna-Repo\`, the bytes are stored and the repo is still being published. \`PATCH\` again with an empty body.
 
 Caps: ${MAX_REPOS} repos in ${DAY / 3600} hours, ${iec(MAX_BYTES)} of live files, ${MAX_UPLOADS} uploads at a time. An upload with no new data for an hour is deleted. Starting another upload with the same name drops the unfinished one.
 
@@ -211,8 +251,9 @@ async function createUpload(request: Request, url: URL, store: Store): Promise<R
     if (old.id === id && old.at + IDLE >= t) await deleteUpload(store, old);
   }
   if (user.pending) await clearPending(store, account);
-  const up: Up = { account, id, length, offset: 0, at: t, parts: [], replace };
+  const up: Up = { account, id, length, offset: 0, at: t, parts: [], replace, tar: emptyTar() };
   await saveUp(store, up);
+  await touchStage(store, up);
   return empty(201, {
     "tus-resumable": TUS,
     location: new URL(`/v1/repos/${id}`, url.origin).toString(),
@@ -224,220 +265,528 @@ async function headUpload(request: Request, store: Store, id: string): Promise<R
   const { account } = await auth(store, request.headers.get("authorization"));
   const up = await loadUp(store, account, id);
   if (!up) return text("not found", 404);
-  return empty(200, tusHeaders(up));
+  return empty(200, headHeaders(up));
 }
 
 async function patchUpload(request: Request, store: Store, id: string): Promise<Response> {
   const { account, user } = await auth(store, request.headers.get("authorization"));
   const up = await loadUp(store, account, id);
   if (!up) return text("not found", 404);
+  if (up.legacy) {
+    await deleteUpload(store, up);
+    return text("upload expired", 410);
+  }
   if (request.headers.get("content-type")?.split(";")[0].trim() !== "application/offset+octet-stream") {
     return text("unsupported media type", 415);
   }
+  const declared = contentLength(request);
+  if (Number.isFinite(declared) && declared > MAX_CHUNK) return text("chunk too large", 413);
+  if (up.done) {
+    await discardBody(request);
+    return empty(204, headHeaders(up));
+  }
   const offset = Number(request.headers.get("upload-offset"));
   if (offset !== up.offset) return text("wrong offset", 409);
-  const declared = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_CHUNK) return text("chunk too large", 413);
-  const body = await readBody(request, MAX_CHUNK);
-  if (up.offset + body.byteLength > up.length) return text("too long", 400);
-  const last = up.offset + body.byteLength === up.length;
-  if (!last && body.byteLength < MIN_CHUNK) return text("chunk too small", 413);
-  await store.put(chunkKey(up, up.offset), body, "application/octet-stream");
-  up.parts.push({ off: up.offset, len: body.byteLength });
-  up.offset += body.byteLength;
-  up.at = now();
-  if (!last) {
-    await saveUp(store, up);
-    return empty(204, tusHeaders(up));
+  if (Number.isFinite(declared)) {
+    if (up.offset + declared > up.length) return text("too long", 400);
+    const declaredLast = up.offset + declared === up.length;
+    if (!declaredLast && declared < MIN_CHUNK) return text("chunk too small", 413);
+    if (up.tar.ready && declared !== up.length - up.offset) return text("wrong offset", 409);
   }
   const stage = `staging/${account}/${id}`;
   const live = `scratch/${account}/${id}`;
+  await touchStage(store, up);
+  let feed: TarFeed | null = null;
   try {
-    const room = MAX_BYTES - liveBytes(user) + replaceCredit(user, id);
-    await store.put(`${stage}.json`, Buffer.from(JSON.stringify({ at: now() })), "application/json");
-    const bytes = await extractTar(store, openTar(store, up), stage, PART, room);
-    const keep = new Set<string>();
-    for (const key of await store.keys(`${stage}/`)) {
-      const dest = live + key.slice(stage.length);
-      await store.copy(key, dest);
-      keep.add(dest);
+    if (!up.tar.ready) feed = await TarFeed.load(store, up, PART, roomFor(user, id));
+    const n = await forEachChunk(request, MAX_CHUNK, async (part) => {
+      if (feed) await feed.push(part);
+    });
+    if (Number.isFinite(declared) && n !== declared) {
+      await feed?.onError(new Error("short body"));
+      return text("incomplete chunk", 400);
     }
-    const created = now();
-    const expire = created + KEEP;
-    const metaKey = `${live}/meta.json`;
-    const meta = Buffer.from(JSON.stringify({ created, expire, bytes }) + "\n");
-    await store.put(metaKey, meta, "application/json");
-    keep.add(metaKey);
-    for (const key of await store.keys(`${live}/`)) {
-      if (!keep.has(key)) await store.del(key);
+    if (!Number.isFinite(declared)) {
+      if (up.offset + n > up.length) return text("too long", 400);
+      const measuredLast = up.offset + n === up.length;
+      if (!measuredLast && n < MIN_CHUNK) return text("chunk too small", 413);
+      if (up.tar.ready && n !== up.length - up.offset) return text("wrong offset", 409);
     }
-    const repo: Repo = { id, created, expire, bytes };
-    await rememberPublish(store, account, repo);
-    await deleteUpload(store, up);
-    await deletePrefix(store, `${stage}/`);
-    await store.del(`${stage}.json`);
-    return empty(204, { ...tusHeaders(up), "x-ftuna-repo": `/${account}/${id}/` });
+    const last = up.offset + n === up.length;
+    if (feed) {
+      if (!last) {
+        const prev = up.tar.file?.holdGen ?? 0;
+        await feed.persistHold(up);
+        up.tar = feed.snapshot();
+        up.offset += n;
+        up.at = now();
+        await saveUp(store, up);
+        await dropStaleHold(store, up, prev, up.tar.file?.holdGen ?? 0);
+        return empty(204, tusHeaders(up));
+      }
+      if (!feed.finished()) throw new HTTPError(422, "bad tar");
+      if (!feed.rpm || !feed.repomd) throw new HTTPError(422, "not a repo");
+      await feed.persistHold(up);
+      up.tar = feed.snapshot();
+      up.tar.ready = true;
+      up.offset = up.length;
+      up.at = now();
+      await saveUp(store, up);
+    } else if (up.offset < up.length) {
+      up.offset = up.length;
+      up.at = now();
+      await saveUp(store, up);
+    }
+    const more = await copySome(store, up, COPY_STEPS);
+    if (more) {
+      up.at = now();
+      await saveUp(store, up);
+      return empty(204, tusHeaders(up));
+    }
+    await finalize(store, up);
+    return empty(204, headHeaders(up));
   } catch (err) {
-    await deleteUpload(store, up);
-    await deletePrefix(store, `${stage}/`);
-    await store.del(`${stage}.json`);
-    if (!up.replace) await deletePrefix(store, `${live}/`);
-    await clearPending(store, account);
+    if (err instanceof HTTPError && err.message !== "chunk too large") {
+      await deleteUpload(store, up);
+      if (!up.replace) await deletePrefix(store, live);
+      await clearPending(store, account);
+    }
     throw err;
   }
+}
+
+function roomFor(user: User, id: string): number {
+  return MAX_BYTES - liveBytes(user) + replaceCredit(user, id);
+}
+
+async function copySome(store: Store, up: Up, budget: number): Promise<boolean> {
+  const stage = `staging/${up.account}/${up.id}`;
+  const live = `scratch/${up.account}/${up.id}`;
+  for (let step = 0; step < budget; step++) {
+    if (!up.tar.copy) {
+      if (up.tar.copyIndex >= up.tar.produced.length) return false;
+      const file = up.tar.produced[up.tar.copyIndex];
+      const from = `${stage}/${file.name}`;
+      const to = `${live}/${file.name}`;
+      if (file.size <= COPY_PART) {
+        await store.copy(from, to);
+        up.tar.copyIndex++;
+        await saveUp(store, up);
+        continue;
+      }
+      up.tar.copy = { name: file.name, size: file.size, upload: await store.startMultipart(to), sent: 0, part: 0, etags: [] };
+      await saveUp(store, up);
+    }
+    const job = up.tar.copy;
+    const from = `${stage}/${job.name}`;
+    const to = `${live}/${job.name}`;
+    if (job.sent < job.size) {
+      const end = Math.min(job.sent + COPY_PART, job.size);
+      const n = job.part + 1;
+      const etag = await store.copyPart(from, to, job.upload, n, job.sent, end);
+      job.part = n;
+      job.etags.push({ n, etag });
+      job.sent = end;
+      await saveUp(store, up);
+    }
+    if (job.sent >= job.size) {
+      try {
+        await store.completeMultipart(to, job.upload, job.etags);
+      } catch (err) {
+        if (!(await store.exists(to))) throw err;
+      }
+      up.tar.copy = null;
+      up.tar.copyIndex++;
+      await saveUp(store, up);
+    }
+  }
+  return up.tar.copy !== null || up.tar.copyIndex < up.tar.produced.length;
+}
+
+async function finalize(store: Store, up: Up) {
+  const stage = `staging/${up.account}/${up.id}`;
+  const live = `scratch/${up.account}/${up.id}`;
+  const keep = new Set<string>();
+  for (const file of up.tar.produced) keep.add(`${live}/${file.name}`);
+  const created = now();
+  const expire = created + KEEP;
+  const bytes = up.tar.written;
+  const metaKey = `${live}/meta.json`;
+  await store.put(metaKey, Buffer.from(JSON.stringify({ created, expire, bytes }) + "\n"), "application/json");
+  keep.add(metaKey);
+  for (const key of await store.keys(`${live}/`)) {
+    if (!keep.has(key)) await store.del(key);
+  }
+  await rememberPublish(store, up.account, { id: up.id, created, expire, bytes });
+  await deletePrefix(store, `${stage}/`);
+  await store.del(`${stage}.json`);
+  await deletePrefix(store, `incoming/${up.account}/${up.id}/`);
+  up.done = true;
+  up.offset = up.length;
+  up.at = now();
+  up.tar.file = null;
+  up.tar.copy = null;
+  await saveUp(store, up);
 }
 
 type Reader = { read(n: number): Promise<Uint8Array | null> };
 
 export async function extractTar(store: Store, src: Reader, prefix: string, partSize: number, room: number): Promise<number> {
-  let rpm = false;
-  let repomd = false;
-  let written = 0;
-  let files = 0;
-  for (;;) {
-    const header = await src.read(512);
-    if (!header) throw new HTTPError(422, "bad tar");
+  const feed = new TarFeed(store, prefix, partSize, room);
+  try {
+    for (;;) {
+      const block = await src.read(512);
+      if (!block) break;
+      if (block.length !== 512) throw new HTTPError(422, "bad tar");
+      await feed.push(block);
+    }
+  } catch (err) {
+    if (err instanceof HTTPError) throw err;
+    throw new HTTPError(422, "bad tar");
+  }
+  if (!feed.finished()) throw new HTTPError(422, "bad tar");
+  if (!feed.rpm || !feed.repomd) throw new HTTPError(422, "not a repo");
+  return feed.written;
+}
+
+class TarFeed {
+  header = new Uint8Array();
+  tail = new Uint8Array();
+  phase: TarState["phase"] = "header";
+  pad = 0;
+  file: {
+    name: string;
+    size: number;
+    left: number;
+    key: string;
+    upload: string;
+    part: number;
+    etags: Etags;
+    hold: Uint8Array;
+    // Part-sized buffer. Small reads are copied into it once; the old path
+    // allocated a new buffer and recopied everything already held.
+    buf?: Uint8Array;
+    holdGen: number;
+    seen: number;
+    skipping: boolean;
+  } | null = null;
+  rpm = false;
+  repomd = false;
+  files = 0;
+  written = 0;
+  produced: Produced[] = [];
+  ready = false;
+  copy: CopyJob | null = null;
+  copyIndex = 0;
+  started = "";
+  loadedUpload = "";
+  store: Store;
+  prefix: string;
+  partSize: number;
+  room: number;
+
+  constructor(store: Store, prefix: string, partSize: number, room: number) {
+    this.store = store;
+    this.prefix = prefix;
+    this.partSize = partSize;
+    this.room = room;
+  }
+
+  static async load(store: Store, up: Up, partSize: number, room: number): Promise<TarFeed> {
+    const feed = new TarFeed(store, `staging/${up.account}/${up.id}`, partSize, room);
+    const tar = up.tar;
+    feed.phase = tar.phase;
+    feed.header = fromB64(tar.header);
+    feed.tail = fromB64(tar.tail);
+    feed.pad = tar.pad;
+    feed.rpm = tar.rpm;
+    feed.repomd = tar.repomd;
+    feed.files = tar.files;
+    feed.written = tar.written;
+    feed.produced = tar.produced.map((file) => ({ ...file }));
+    feed.ready = tar.ready;
+    feed.copy = tar.copy ? { ...tar.copy, etags: tar.copy.etags.map((part) => ({ ...part })) } : null;
+    feed.copyIndex = tar.copyIndex;
+    if (tar.file) {
+      feed.loadedUpload = tar.file.upload;
+      const hold = tar.file.holdGen ? await store.get(holdObject(up, tar.file.holdGen)) : new Uint8Array();
+      if (tar.file.holdGen && !hold) throw new Error("missing hold");
+      feed.file = { ...tar.file, etags: tar.file.etags.map((part) => ({ ...part })), hold: hold ?? new Uint8Array() };
+    }
+    return feed;
+  }
+
+  finished(): boolean {
+    return this.phase === "zero" && this.tail.length === 0 && !this.file;
+  }
+
+  snapshot(): TarState {
+    return {
+      phase: this.phase,
+      header: toB64(this.header),
+      tail: toB64(this.tail),
+      pad: this.pad,
+      file: this.file
+        ? {
+            name: this.file.name,
+            size: this.file.size,
+            left: this.file.left,
+            key: this.file.key,
+            upload: this.file.upload,
+            part: this.file.part,
+            etags: this.file.etags,
+            holdGen: this.file.hold.length ? this.file.holdGen : 0,
+            seen: this.file.seen,
+            skipping: this.file.skipping,
+          }
+        : null,
+      rpm: this.rpm,
+      repomd: this.repomd,
+      files: this.files,
+      written: this.written,
+      produced: this.produced,
+      ready: this.ready,
+      copy: this.copy,
+      copyIndex: this.copyIndex,
+    };
+  }
+
+  async persistHold(up: Up) {
+    if (!this.file || this.file.hold.length === 0) {
+      if (this.file) this.file.holdGen = 0;
+      return;
+    }
+    const next = this.file.holdGen === 1 ? 2 : 1;
+    await this.store.put(holdObject(up, next), this.file.hold, "application/octet-stream");
+    this.file.holdGen = next;
+  }
+
+  async push(chunk: Uint8Array) {
+    try {
+      await this.consume(chunk);
+    } catch (err) {
+      await this.onError(err);
+      throw err;
+    }
+  }
+
+  async onError(err: unknown) {
+    const upload = this.file?.upload;
+    if (!upload || !this.file) return;
+    const fresh = this.started !== "" && this.started === upload && this.started !== this.loadedUpload;
+    if (err instanceof HTTPError || fresh) await this.store.abortMultipart(this.file.key, upload).catch(() => {});
+  }
+
+  async consume(chunk: Uint8Array) {
+    let data = chunk;
+    if (this.tail.length) {
+      const merged = new Uint8Array(this.tail.length + chunk.length);
+      merged.set(this.tail, 0);
+      merged.set(chunk, this.tail.length);
+      this.tail = new Uint8Array();
+      data = merged;
+    }
+    let pos = 0;
+    while (pos < data.length) {
+      if (this.phase === "header") {
+        const need = 512 - this.header.length;
+        const n = Math.min(need, data.length - pos);
+        const next = new Uint8Array(this.header.length + n);
+        next.set(this.header, 0);
+        next.set(data.subarray(pos, pos + n), this.header.length);
+        this.header = next;
+        pos += n;
+        if (this.header.length < 512) break;
+        await this.openHeader();
+      } else if (this.phase === "body") {
+        const file = this.file;
+        if (!file) throw new HTTPError(422, "bad tar");
+        const n = Math.min(file.left, data.length - pos);
+        await this.writeBody(file, data.subarray(pos, pos + n));
+        pos += n;
+        file.left -= n;
+        if (file.left === 0) await this.finishBody();
+      } else if (this.phase === "pad") {
+        const n = Math.min(this.pad, data.length - pos);
+        pos += n;
+        this.pad -= n;
+        if (this.pad === 0) this.phase = "header";
+      } else {
+        if (data.length - pos < 512) {
+          this.tail = data.slice(pos);
+          break;
+        }
+        if (!zeroBlock(data.subarray(pos, pos + 512))) throw new HTTPError(422, "bad tar");
+        pos += 512;
+      }
+    }
+  }
+
+  async openHeader() {
+    const header = this.header;
+    this.header = new Uint8Array();
     if (zeroBlock(header)) {
-      await zeroRest(src);
-      break;
+      this.phase = "zero";
+      return;
     }
     if (!tarChecksum(header)) throw new HTTPError(422, "bad tar");
     const name = tarName(header);
     const size = tarOctal(header.subarray(124, 136));
     const kind = header[156];
     if (kind === 53 || name.endsWith("/")) {
-      await discard(src, size + pad(size));
-      continue;
+      this.phase = "pad";
+      this.pad = size + pad(size);
+      return;
     }
     if (kind !== 0 && kind !== 48) throw new HTTPError(422, "bad path");
     if (!allowPath(name)) throw new HTTPError(422, "bad path");
-    if (++files > 2000) throw new HTTPError(422, "bad tar");
-    if (name.endsWith(".rpm")) rpm = true;
-    if (name.endsWith("/repomd.xml")) repomd = true;
-    written += await writeFile(store, src, size, `${prefix}/${name}`, partSize, room - written);
-    await discard(src, pad(size));
+    if (++this.files > 2000) throw new HTTPError(422, "bad tar");
+    if (name.endsWith(".rpm")) this.rpm = true;
+    if (name.endsWith("/repomd.xml")) this.repomd = true;
+    this.file = {
+      name,
+      size,
+      left: size,
+      key: `${this.prefix}/${name}`,
+      upload: "",
+      part: 0,
+      etags: [],
+      hold: new Uint8Array(),
+      holdGen: 0,
+      seen: 0,
+      skipping: false,
+    };
+    this.phase = "body";
+    if (size === 0) await this.finishBody();
   }
-  if (!rpm || !repomd) throw new HTTPError(422, "not a repo");
-  return written;
-}
 
-class Pieces {
-  parts: Uint8Array[] = [];
-  len = 0;
-  push(chunk: Uint8Array) {
-    if (!chunk.length) return;
-    this.parts.push(chunk);
-    this.len += chunk.length;
-  }
-  take(n: number): Uint8Array {
-    const out = new Uint8Array(n);
-    let offset = 0;
-    while (offset < n) {
-      const chunk = this.parts[0];
-      const k = Math.min(chunk.length, n - offset);
-      out.set(chunk.subarray(0, k), offset);
-      offset += k;
-      if (k === chunk.length) this.parts.shift();
-      else this.parts[0] = chunk.subarray(k);
+  async writeBody(file: NonNullable<TarFeed["file"]>, bytes: Uint8Array) {
+    if (file.skipping || bytes.length === 0) return;
+    if (file.name.endsWith(".rpm")) {
+      const magic = [0xed, 0xab, 0xee, 0xdb];
+      for (let i = 0; i < bytes.length && file.seen < 4; i++, file.seen++) {
+        if (bytes[i] !== magic[file.seen]) throw new HTTPError(422, "bad rpm");
+      }
     }
-    this.len -= n;
-    return out;
+    if (this.written + bytes.length > this.room) throw new HTTPError(413, "too much data");
+    this.written += bytes.length;
+    if (!file.buf) {
+      file.buf = new Uint8Array(this.partSize);
+      if (file.hold.length) file.buf.set(file.hold, 0);
+    }
+    let filled = file.hold.length;
+    let off = 0;
+    while (off < bytes.length) {
+      const room = this.partSize - filled;
+      const take = Math.min(room, bytes.length - off);
+      file.buf.set(bytes.subarray(off, off + take), filled);
+      filled += take;
+      off += take;
+      if (filled === this.partSize) {
+        if (await this.emitPart(file, file.buf.slice())) return;
+        filled = 0;
+      }
+    }
+    file.hold = filled === 0 ? new Uint8Array() : file.buf.subarray(0, filled);
   }
-}
 
-async function writeFile(store: Store, src: Reader, size: number, key: string, partSize: number, room: number): Promise<number> {
-  const pieces = new Pieces();
-  let upload = "";
-  let part = 0;
-  const etags: { n: number; etag: string }[] = [];
-  let seen = 0;
-  let produced = 0;
-  let left = size;
-  const rpm = key.endsWith(".rpm");
-  const magic = [0xed, 0xab, 0xee, 0xdb];
-  const fail = async (err: unknown): Promise<never> => {
-    if (upload) await store.abortMultipart(key, upload).catch(() => {});
-    throw err;
-  };
-  try {
-    while (left > 0) {
-      const n = Math.min(WINDOW, left);
-      const chunk = await src.read(n);
-      if (!chunk || chunk.byteLength !== n) throw new HTTPError(422, "bad tar");
-      left -= n;
-      if (rpm) {
-        for (let i = 0; i < chunk.length && seen < 4; i++, seen++) {
-          if (chunk[i] !== magic[seen]) throw new HTTPError(422, "bad rpm");
+  async emitPart(file: NonNullable<TarFeed["file"]>, body: Uint8Array): Promise<boolean> {
+    if (!file.upload) {
+      file.upload = await this.store.startMultipart(file.key);
+      if (file.upload !== this.loadedUpload) this.started = file.upload;
+    }
+    const n = file.part + 1;
+    try {
+      const etag = await this.store.putPart(file.key, file.upload, n, body);
+      file.part = n;
+      file.etags.push({ n, etag });
+      return false;
+    } catch (err) {
+      if (await this.alive(file)) return true;
+      throw err;
+    }
+  }
+
+  async finishBody() {
+    const file = this.file;
+    if (!file) throw new HTTPError(422, "bad tar");
+    if (file.name.endsWith(".rpm") && !file.skipping && file.seen < 4) throw new HTTPError(422, "bad rpm");
+    if (!file.skipping) {
+      if (!file.upload) await this.store.put(file.key, file.hold, contentType(file.key));
+      else {
+        if (file.hold.length) {
+          const n = file.part + 1;
+          try {
+            const etag = await this.store.putPart(file.key, file.upload, n, file.hold);
+            file.part = n;
+            file.etags.push({ n, etag });
+          } catch (err) {
+            if (!(await this.alive(file))) throw err;
+          }
+        }
+        if (!file.skipping) {
+          try {
+            await this.store.completeMultipart(file.key, file.upload, file.etags);
+          } catch (err) {
+            if (!(await this.store.exists(file.key))) throw err;
+          }
         }
       }
-      if (produced + chunk.length > room) throw new HTTPError(413, "too much data");
-      produced += chunk.length;
-      pieces.push(chunk);
-      while (pieces.len >= partSize) {
-        if (!upload) upload = await store.startMultipart(key);
-        part++;
-        etags.push({ n: part, etag: await store.putPart(key, upload, part, pieces.take(partSize)) });
-      }
     }
-  } catch (err) {
-    await fail(err instanceof HTTPError ? err : new HTTPError(422, "bad tar"));
+    this.produced.push({ name: file.name, size: file.size });
+    this.file = null;
+    const extra = pad(file.size);
+    this.phase = extra === 0 ? "header" : "pad";
+    this.pad = extra;
   }
-  if (rpm && seen < 4) await fail(new HTTPError(422, "bad rpm"));
-  const type = contentType(key);
-  if (!upload) await store.put(key, pieces.take(pieces.len), type);
-  else {
-    if (pieces.len) {
-      part++;
-      etags.push({ n: part, etag: await store.putPart(key, upload, part, pieces.take(pieces.len)) });
-    }
-    await store.completeMultipart(key, upload, etags);
+
+  async alive(file: NonNullable<TarFeed["file"]>): Promise<boolean> {
+    if (!(await this.store.exists(file.key))) return false;
+    file.skipping = true;
+    file.hold = new Uint8Array();
+    return true;
   }
-  return produced;
 }
 
-function openTar(store: Store, up: Up): Reader {
-  let pos = 0;
-  let idx = 0;
+function emptyTar(): TarState {
   return {
-    async read(n) {
-      if (n > WINDOW) throw new HTTPError(422, "bad tar");
-      if (pos >= up.length) return null;
-      if (pos + n > up.length) throw new HTTPError(422, "bad tar");
-      const out = new Uint8Array(n);
-      let got = 0;
-      while (got < n) {
-        while (idx < up.parts.length && up.parts[idx].off + up.parts[idx].len <= pos) idx++;
-        const part = up.parts[idx];
-        if (!part || part.off > pos) throw new HTTPError(422, "bad tar");
-        const local = pos - part.off;
-        const take = Math.min(n - got, part.len - local);
-        const buf = await store.range(chunkKey(up, part.off), local, local + take);
-        if (buf.byteLength < take) throw new HTTPError(422, "bad tar");
-        out.set(buf.subarray(0, take), got);
-        got += take;
-        pos += take;
-      }
-      return out;
-    },
+    phase: "header",
+    header: "",
+    tail: "",
+    pad: 0,
+    file: null,
+    rpm: false,
+    repomd: false,
+    files: 0,
+    written: 0,
+    produced: [],
+    ready: false,
+    copy: null,
+    copyIndex: 0,
   };
 }
 
-async function discard(src: Reader, n: number) {
-  let left = n;
-  while (left > 0) {
-    const nread = Math.min(WINDOW, left);
-    const chunk = await src.read(nread);
-    if (!chunk || chunk.byteLength !== nread) throw new HTTPError(422, "bad tar");
-    left -= nread;
-  }
+function holdObject(up: Up, gen: number): string {
+  return `incoming/${up.account}/${up.id}/hold/${gen}`;
 }
 
-async function zeroRest(src: Reader) {
-  for (;;) {
-    const block = await src.read(512);
-    if (!block) return;
-    if (!zeroBlock(block)) throw new HTTPError(422, "bad tar");
+async function dropStaleHold(store: Store, up: Up, prev: number, keep: number) {
+  for (const gen of [1, 2]) {
+    if (gen !== keep && gen !== 0) await store.del(holdObject(up, gen)).catch(() => {});
   }
+  if (prev && prev !== keep) await store.del(holdObject(up, prev)).catch(() => {});
+}
+
+async function touchStage(store: Store, up: Up) {
+  await store.put(`staging/${up.account}/${up.id}.json`, Buffer.from(JSON.stringify({ at: now() })), "application/json");
+}
+
+function toB64(bytes: Uint8Array): string {
+  return bytes.length ? Buffer.from(bytes).toString("base64") : "";
+}
+
+function fromB64(value: string): Uint8Array {
+  return value ? new Uint8Array(Buffer.from(value, "base64")) : new Uint8Array();
 }
 
 function tarName(header: Uint8Array): string {
@@ -594,6 +943,12 @@ function tusHeaders(up: Up): Record<string, string> {
     "upload-expires": new Date((up.at + IDLE) * 1000).toUTCString(),
     "cache-control": "no-store",
   };
+}
+
+function headHeaders(up: Up): Record<string, string> {
+  const headers = tusHeaders(up);
+  if (up.done) headers["x-ftuna-repo"] = `/${up.account}/${up.id}/`;
+  return headers;
 }
 
 function bitsOf(env: Env): number {
@@ -803,12 +1158,9 @@ function now(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-function chunkKey(up: Up, off: number): string {
-  return `incoming/${up.account}/${up.id}/${off}`;
-}
-
 async function saveUp(store: Store, up: Up) {
-  await store.put(`incoming/${up.account}/${up.id}.json`, Buffer.from(JSON.stringify(up)), "application/json");
+  const { legacy: _legacy, ...rest } = up;
+  await store.put(`incoming/${up.account}/${up.id}.json`, Buffer.from(JSON.stringify(rest)), "application/json");
 }
 
 async function loadUp(store: Store, account: string, id: string): Promise<Up | null> {
@@ -860,6 +1212,10 @@ function parseUser(raw: Uint8Array | null): User | null {
 function parseUp(raw: Uint8Array | null): Up | null {
   const value = parseJSON(raw) as Up | null;
   if (!value || !Array.isArray(value.parts)) return null;
+  if (!value.tar) {
+    value.legacy = value.offset > 0;
+    value.tar = emptyTar();
+  }
   return value;
 }
 
@@ -873,12 +1229,51 @@ function parseJSON(raw: Uint8Array | null): unknown {
 }
 
 async function deleteUpload(store: Store, up: Up) {
+  const file = up.tar?.file;
+  if (file?.upload) await store.abortMultipart(file.key, file.upload).catch(() => {});
+  if (up.tar?.copy?.upload) {
+    await store.abortMultipart(`scratch/${up.account}/${up.id}/${up.tar.copy.name}`, up.tar.copy.upload).catch(() => {});
+  }
   await deletePrefix(store, `incoming/${up.account}/${up.id}/`);
   await store.del(`incoming/${up.account}/${up.id}.json`);
+  await deletePrefix(store, `staging/${up.account}/${up.id}/`);
+  await store.del(`staging/${up.account}/${up.id}.json`);
 }
 
 async function deletePrefix(store: Store, prefix: string) {
   for (const key of await store.keys(prefix)) await store.del(key);
+}
+
+function contentLength(request: Request): number {
+  const raw = request.headers.get("content-length");
+  if (raw === null || raw === "") return Number.NaN;
+  return Number(raw);
+}
+
+async function discardBody(request: Request) {
+  await forEachChunk(request, MAX_CHUNK, async () => {});
+}
+
+async function forEachChunk(request: Request, max: number, onChunk: (part: Uint8Array) => Promise<void>): Promise<number> {
+  const reader = request.body?.getReader();
+  if (!reader) return 0;
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    let off = 0;
+    while (off < value.byteLength) {
+      const take = Math.min(PART, value.byteLength - off);
+      n += take;
+      if (n > max) {
+        await reader.cancel();
+        throw new HTTPError(413, "chunk too large");
+      }
+      await onChunk(value.subarray(off, off + take));
+      off += take;
+    }
+  }
+  return n;
 }
 
 async function readBody(request: Request, max: number): Promise<Uint8Array> {
@@ -896,7 +1291,13 @@ async function readBody(request: Request, max: number): Promise<Uint8Array> {
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks);
+  const out = new Uint8Array(n);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 async function readJSON(request: Request): Promise<unknown> {
