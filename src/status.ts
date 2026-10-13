@@ -59,7 +59,6 @@ details[open] > summary { background: var(--row); }
 .name a:hover { color: var(--link); }
 .icon { width: 1.25rem; height: 1.25rem; margin-right: 0.45rem; border-radius: 0.2rem; vertical-align: -0.2rem; object-fit: cover; }
 .commit { color: var(--muted); font-size: 0.88rem; font-variant-numeric: tabular-nums; }
-.blame { flex: 1 0 100%; color: var(--muted); font-size: 0.88rem; overflow-wrap: anywhere; }
 .state { font-size: 0.75rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
 .state.failed { color: #9c3412; }
 .state.building { color: var(--link); }
@@ -281,12 +280,6 @@ function recipeItem(recipe) {
   commit.className = "commit";
   commit.textContent = commitLabel(recipe);
   summary.append(name, state, commit);
-  if (recipe.error) {
-    const blame = document.createElement("span");
-    blame.className = "blame";
-    blame.textContent = recipe.error;
-    summary.append(blame);
-  }
   details.append(summary, recipeBody(recipe, details));
   li.append(details);
   return li;
@@ -346,15 +339,19 @@ function recipeBody(recipe, details) {
     }
     body.append(ul);
   }
-  if (typeof recipe.log === "string" && recipe.log.trim()) {
-    const pre = document.createElement("pre");
-    pre.className = "log";
-    details.addEventListener("toggle", function () {
-      if (details.open && pre.textContent === "") pre.textContent = recipe.log;
-    });
-    body.append(pre);
-  }
+  appendLog(body, details, recipe.error);
+  appendLog(body, details, recipe.log);
   return body;
+}
+
+function appendLog(body, details, text) {
+  if (typeof text !== "string" || !text.trim()) return;
+  const pre = document.createElement("pre");
+  pre.className = "log";
+  details.addEventListener("toggle", function () {
+    if (details.open && pre.textContent === "") pre.textContent = text;
+  });
+  body.append(pre);
 }
 
 function archOrder(recipe, rpms) {

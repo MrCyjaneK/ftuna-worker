@@ -8,6 +8,8 @@ test("status page is a client-side shell", () => {
   assert.match(statusPage, /\/status\.json/);
   assert.match(statusPage, /hashchange/);
   assert.match(statusPage, /prefers-color-scheme: dark/);
+  assert.match(statusPage, /appendLog\(body, details, recipe\.error\)/);
+  assert.equal(statusPage.includes("blame"), false);
   assert.equal(statusPage.includes("abseil"), false);
   assert.equal(statusText.includes("<"), false);
   assert.ok(statusText.includes("https://repo-oss.ftuna.eu/status"));
